@@ -1,4 +1,4 @@
-// ============================================================
+//=============================================================
 // TIER 3: DATA TIER
 // Owns the schema and all direct reads/writes to storage.
 // Nothing outside this file talks to MySQL directly — the
@@ -10,26 +10,35 @@
 // ============================================================
 
 require("dotenv").config();
+
 const mysql = require("mysql2/promise");
+const fs = require("fs");
 
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  port: process.env.DB_PORT || 3306,
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "task_tracker",
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 3306),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+
   waitForConnections: true,
   connectionLimit: 10,
-  // Uncomment when connecting to RDS over SSL:
-  // ssl: { rejectUnauthorized: true },
+  queueLimit: 0,
+
+  ssl: process.env.DB_SSL_CA
+    ? {
+        ca: fs.readFileSync(process.env.DB_SSL_CA),
+        rejectUnauthorized: true
+      }
+    : undefined
 });
 
 async function initSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tasks (
-      id         INT AUTO_INCREMENT PRIMARY KEY,
-      title      VARCHAR(140) NOT NULL,
-      done       TINYINT(1) NOT NULL DEFAULT 0,
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      title VARCHAR(140) NOT NULL,
+      done TINYINT(1) NOT NULL DEFAULT 0,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -39,26 +48,48 @@ module.exports = {
   initSchema,
 
   async getAllTasks() {
-    const [rows] = await pool.query("SELECT * FROM tasks ORDER BY created_at DESC");
+    const [rows] = await pool.query(
+      "SELECT * FROM tasks ORDER BY created_at DESC"
+    );
     return rows;
   },
 
   async createTask(title) {
-    const [result] = await pool.query("INSERT INTO tasks (title) VALUES (?)", [title]);
-    const [rows] = await pool.query("SELECT * FROM tasks WHERE id = ?", [result.insertId]);
+    const [result] = await pool.query(
+      "INSERT INTO tasks (title) VALUES (?)",
+      [title]
+    );
+
+    const [rows] = await pool.query(
+      "SELECT * FROM tasks WHERE id = ?",
+      [result.insertId]
+    );
+
     return rows[0];
   },
 
   async toggleTask(id) {
-    await pool.query("UPDATE tasks SET done = NOT done WHERE id = ?", [id]);
-    const [rows] = await pool.query("SELECT * FROM tasks WHERE id = ?", [id]);
+    const [result] = await pool.query(
+      "UPDATE tasks SET done = NOT done WHERE id = ?",
+      [id]
+    );
+
+    if (result.affectedRows === 0) return null;
+
+    const [rows] = await pool.query(
+      "SELECT * FROM tasks WHERE id = ?",
+      [id]
+    );
+
     return rows[0];
   },
 
   async deleteTask(id) {
-    const [existing] = await pool.query("SELECT * FROM tasks WHERE id = ?", [id]);
-    if (existing.length === 0) return false;
-    await pool.query("DELETE FROM tasks WHERE id = ?", [id]);
-    return true;
-  },
+    const [result] = await pool.query(
+      "DELETE FROM tasks WHERE id = ?",
+      [id]
+    );
+
+    return result.affectedRows > 0;
+  }
 };
