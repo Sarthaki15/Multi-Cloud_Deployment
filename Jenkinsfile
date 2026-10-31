@@ -4,25 +4,40 @@ pipeline {
 
     options {
         timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
     }
 
     environment {
         DOCKERHUB_REPO = 'sarthakiparad2230/three-tier-app'
         EKS_CLUSTER_NAME = 'CD-Cluster'
-        AWS_DEFAULT_REGION = 'eu-north-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        K8S_DEPLOYMENT = 'three-tier-app-deployment'
+        K8S_CONTAINER = 'three-tier-app'
+        K8S_SECRET = 'three-tier-app-db-secrets'
     }
 
     stages {
         stage('Git Checkout') {
             steps {
                 git branch: 'main',
-                    url: 'https://github.com/Sarthaki15/three-tier-app.git'
+                    url: 'https://github.com/Sarthaki15/Multi-Cloud_Deployment.git'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    set -eu
+                    npm ci
+                '''
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 sh '''
+                    set -eu
                     docker build \
                       -t "$DOCKERHUB_REPO:$BUILD_NUMBER" \
                       -t "$DOCKERHUB_REPO:latest" .
@@ -34,160 +49,163 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'app-env-file',
+                        credentialsId: 'APP_ENV_FILE',
                         variable: 'APP_ENV_FILE'
                     )
                 ]) {
                     sh '''
+                        set +x
                         set -eu
 
-                        docker rm -f test-app || true
+                        docker rm -f test-app >/dev/null 2>&1 || true
 
                         docker run -d \
                           --name test-app \
                           --env-file "$APP_ENV_FILE" \
-                          -p 8080:3000 \
+                          -p 127.0.0.1:8080:3000 \
                           "$DOCKERHUB_REPO:$BUILD_NUMBER"
 
-                        sleep 10
+                        i=1
 
-                        docker ps -a --filter "name=test-app"
+                        while [ "$i" -le 30 ]; do
+                            if curl -fsS http://127.0.0.1:8080/health; then
+                                echo "Application health check passed."
+                                exit 0
+                            fi
+
+                            echo "Waiting for startup... attempt $i/30"
+                            sleep 2
+                            i=$((i + 1))
+                        done
+
+                        docker ps -a --filter name=test-app
                         docker logs test-app
-
-                        curl --fail \
-                          --retry 5 \
-                          --retry-delay 2 \
-                          --retry-connrefused \
-                          http://localhost:8080/
+                        exit 1
                     '''
                 }
             }
 
             post {
                 always {
-                    sh 'docker rm -f test-app || true'
+                    sh 'docker rm -f test-app >/dev/null 2>&1 || true'
                 }
             }
         }
 
-        stage('Docker Hub Login') {
+        stage('Docker Hub Login and Push') {
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'docker-login',
-                        usernameVariable: 'docker_username',
-                        passwordVariable: 'docker_password'
+                        credentialsId: 'dockerhub-login',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
                     )
                 ]) {
                     sh '''
                         set +x
-                        printf '%s' "$docker_password" |
+                        set -eu
+
+                        printf '%s' "$DOCKER_PASSWORD" |
                           docker login \
-                            -u "$docker_username" \
+                            --username "$DOCKER_USERNAME" \
                             --password-stdin
+
+                        docker push "$DOCKERHUB_REPO:$BUILD_NUMBER"
+                        docker push "$DOCKERHUB_REPO:latest"
+
+                        docker logout || true
                     '''
                 }
             }
         }
 
-        stage('Push Docker Image') {
+        stage('Configure AWS and EKS') {
             steps {
                 sh '''
-                    docker push "$DOCKERHUB_REPO:$BUILD_NUMBER"
-                    docker push "$DOCKERHUB_REPO:latest"
+                    set -eu
+
+                    aws sts get-caller-identity
+
+                    aws eks update-kubeconfig \
+                      --name "$EKS_CLUSTER_NAME" \
+                      --region "$AWS_DEFAULT_REGION"
+
+                    kubectl get nodes
                 '''
+            }
+        }
+
+        stage('Update Kubernetes Secret') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'secrets-db-env',
+                        variable: 'DB_ENV_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        set -eu
+
+                        kubectl create secret generic "$K8S_SECRET" \
+                          --from-env-file="$DB_ENV_FILE" \
+                          --dry-run=client \
+                          -o yaml |
+                          kubectl apply -f -
+                    '''
+                }
             }
         }
 
         stage('Deploy to EKS') {
             steps {
-                withCredentials([
-                    aws(
-                        credentialsId: 'aws_access_key',
-                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-                    ),
-                    file(
-                        credentialsId: 'db-env-secrets-yaml',
-                        variable: 'DB_ENV_FILE'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-                        set +x
+                sh '''
+                    set -eu
 
-                        aws sts get-caller-identity
+                    kubectl apply -f kubernetes/deployment.yaml
+                    kubectl apply -f kubernetes/service.yaml
 
-                        aws eks update-kubeconfig \
-                          --name "$EKS_CLUSTER_NAME" \
-                          --region "$AWS_DEFAULT_REGION"
+                    kubectl set image \
+                      deployment/"$K8S_DEPLOYMENT" \
+                      "$K8S_CONTAINER=$DOCKERHUB_REPO:$BUILD_NUMBER"
 
-                        kubectl get nodes
-
-                        echo "Creating/updating Kubernetes Secret..."
-
-                        kubectl create secret generic three-tier-app-db-secrets \
-                          --from-env-file="$DB_ENV_FILE" \
-                          --dry-run=client \
-                          -o yaml |
-                          kubectl apply -f -
-
-                        echo "Applying Kubernetes Deployment..."
-
-                        kubectl apply -f kubernetes/deployment.yaml
-
-                        echo "Updating application image..."
-
-                        kubectl set image \
-                          deployment/three-tier-app-deployment \
-                          three-tier-app="$DOCKERHUB_REPO:$BUILD_NUMBER"
-
-                        echo "Applying Kubernetes Service..."
-
-                        kubectl apply -f kubernetes/service.yaml
-
-                        echo "Waiting for rollout..."
-
-                        kubectl rollout status \
-                          deployment/three-tier-app-deployment \
-                          --timeout=180s
-                    '''
-                }
+                    kubectl rollout status \
+                      deployment/"$K8S_DEPLOYMENT" \
+                      --timeout=180s
+                '''
             }
         }
 
-        stage('Verify Kubernetes Deployment') {
+        stage('Verify Deployment') {
             steps {
-                withCredentials([
-                    aws(
-                        credentialsId: 'aws_access_key',
-                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        aws eks update-kubeconfig \
-                          --name "$EKS_CLUSTER_NAME" \
-                          --region "$AWS_DEFAULT_REGION"
+                    kubectl get deployment "$K8S_DEPLOYMENT"
+                    kubectl get pods -o wide
+                    kubectl get services
 
-                        echo "Deployment status:"
-                        kubectl get deployment three-tier-app-deployment
+                    kubectl rollout status \
+                      deployment/"$K8S_DEPLOYMENT" \
+                      --timeout=180s
 
-                        echo "Pod status:"
-                        kubectl get pods -o wide
-
-                        echo "Service status:"
-                        kubectl get services
-
-                        echo "Rollout status:"
-                        kubectl rollout status \
-                          deployment/three-tier-app-deployment \
-                          --timeout=180s
-                    '''
-                }
+                    echo "CI/CD deployment verified successfully."
+                '''
             }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI/CD Pipeline completed successfully!'
+        }
+
+        failure {
+            echo 'CI/CD Pipeline failed. Check the failed stage logs.'
+        }
+
+        always {
+            sh 'docker rm -f test-app >/dev/null 2>&1 || true'
         }
     }
 }
