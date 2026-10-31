@@ -1,3 +1,4 @@
 .env
 node_modules/
 kubernetes/db.env
+kubernetes/secrets.yaml
